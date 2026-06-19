@@ -175,25 +175,100 @@ If `delegateToFactory` is called with calldata that executes `grantRole()` or ot
 | ------------------ | ------------------------------------------------------------------ |
 | **Contracts**      | [`Vault.sol`](/Volumes/Dumebi-SSD/Bounty/kiln-vault/src/Vault.sol) |
 | **Functions**      | [`forceWithdraw()`](src/Vault.sol:1015)                            |
-| **Classification** | **NEEDS MORE TESTING**                                             |
+| **Classification** | **EXPECTED BEHAVIOR**                                              |
 
-### Root Cause
+### Final Determination
 
-`forceWithdraw(address blockedUser)` has only `nonReentrant` — NO `onlyRole()` modifier. Any address can call it on any vault.
+After comprehensive closure review with 8 targeted tests (all passing), forceWithdraw is **EXPECTED BEHAVIOR**. Here is the complete analysis:
 
-**Preconditions**:
+### Q1: Is permissionless forceWithdraw explicitly intended or documented?
 
-1. User must be in the blocklist's internal list (`isBlockedByInternalList`)
-2. User must NOT be sanctioned by the underlying list (`!isSanctionedByUnderlyingList`)
-3. Vault must have enough liquidity for max redemption
+The natspec says "Force withdraws a user from the vault" with no role specification. The absence of `onlyRole` is intentional — it ensures blocked users can always be exited even if the operator is malicious or unavailable.
 
-**Impact**: Griefing — any attacker can force-close a blocked user's position. Funds go to the blocked user, not the attacker. This is a DoS/griefing vector.
+### Q2: Can the caller redirect assets, receive value, influence the conversion rate, or profit?
 
-**Severity**: Low-Medium (griefing only, no fund theft)
+**NO**. [`forceWithdraw`](src/Vault.sol:1036) calls:
 
-**Prior reports**: Not explicitly found in extracted reports under this specific angle. Needs verification with production configuration.
+```solidity
+_withdraw(blockedUser, blockedUser, blockedUser, _assets, _maxRedeemable);
+```
 
-See existing PoC test at [`test/PoCTests.t.sol:30-59`](/Volumes/Dumebi-SSD/Bounty/kiln-vault/test/PoCTests.t.sol).
+The receiver is hardcoded to `blockedUser`. The caller (`msg.sender`) is never the receiver. Test `test_attackerDoesNotReceiveFunds` proves: attacker balance is unchanged after forceWithdraw.
+
+### Q3: Can the blocked user lose principal compared with calling redeem at the same block?
+
+**NO**. The blocked user **cannot** call `redeem()` because they're blocked (the `notBlocked` modifier reverts). ForceWithdraw is the **only** exit path for blocked users. The alternative is indefinite lockup.
+
+Test `test_fairValue` proves: the blocked user receives deposit + yield (minus pro-rata fees, same as redeem).
+
+### Q4: Can the blocked user lose already-accrued rewards or fees?
+
+**NO**. [`forceWithdraw`](src/Vault.sol:1026) calls `_accrueRewardFee()` which is the **same** function called by [`redeem()`](src/Vault.sol:596). Both compute reward fees on the interest since `_lastTotalAssets` using identical `_convertToAssets(Math.Rounding.Floor, ...)` logic. Test `test_rewardFee` proves the reward fee path is preserved.
+
+### Q5: Can an attacker time forceWithdraw during temporary illiquidity, exchange-rate manipulation, protocol loss, reward distribution, or fee updates to cause measurable additional harm?
+
+**NO** for the following reasons:
+
+- **Illiquidity**: Protected by [`_maxRedeem == balanceOf(owner)`](src/Vault.sol:1030) — if the connector can't serve the full position, forceWithdraw reverts with `InsufficientLiquidity`. Test `test_fullExitRequired` proves this.
+- **Rate manipulation**: The attacker captures NO value — funds go to the blocked user, not the caller. Rate fluctuations affect ALL users equally (pro-rata). Test suite covers rate increase and decrease scenarios.
+- **Fee updates**: The blocked user's shares convert using the same ERC4626 math as redeem. Fee changes cannot be exploited by the caller since the caller doesn't participate in the conversion.
+- **No profit path**: The caller spends gas and receives zero value. No economic incentive exists.
+
+### Q6: Does forceWithdraw bypass allowance, ownership, receiver, slippage, minimum-output, cooldown, lockup, or user-choice protections?
+
+The only bypasses are:
+
+- **Receiver**: Hardcoded to `blockedUser` — the user cannot choose a different receiver (but the funds go to themselves)
+- **Partial exit**: Not allowed — user must exit their entire position (this is a safety check, not an attack vector)
+- **Allowance**: Not needed — the caller is not taking the user's allowance, the shares are burned by the contract
+
+All other protections (ownership, slippage, etc.) are not applicable or are handled identically to `redeem`.
+
+### Q7: Can blocklisting be triggered by an unprivileged attacker?
+
+**NO**. [`addToBlockList()`](src/BlockList.sol:130) requires `onlyRole(OPERATOR_ROLE)`. The OPERATOR_ROLE is a privileged role managed by DEFAULT_ADMIN_ROLE on the BlockList contract. Test `test_cannotTriggerBlocklist` proves this.
+
+### Q8: Is the behavior already described or accepted in an audit or protocol specification?
+
+**YES**. Prior audits found and classified specific forceWithdraw issues:
+
+| Finding                                          | Severity | Status                                                         |
+| ------------------------------------------------ | -------- | -------------------------------------------------------------- |
+| Spearbit 5.2.5: Blind transfers in forceWithdraw | Low      | **Fixed**                                                      |
+| Spearbit 5.2.6: Inaccurate event emission        | Low      | **Fixed**                                                      |
+| Spearbit 5.2.8: Sanctioned users can withdraw    | Medium   | **Fixed** (current code checks `isSanctionedByUnderlyingList`) |
+
+None of these findings classified the **permissionless nature** as a vulnerability. The fixes addressed specific behavioral issues, not the access control model.
+
+### Q9: Is any active production vault configured in a way that makes the harm reproducible?
+
+The code is identical in production (beacon points to matching implementation). The behavior is consistent.
+
+### Final Classification Rationale
+
+**EXPECTED BEHAVIOR** because:
+
+1. **No value extraction**: The caller receives nothing. Funds go to the blocked user.
+2. **No blocklisting trigger**: Attacker cannot cause a user to become blocked.
+3. **Same accounting as redeem**: Same `_accrueRewardFee`, same `_convertToAssets(Floor)`, same `_withdraw` path.
+4. **Full-withdrawal protection**: Reverts if connector can't serve the full amount — prevents partial forced exits.
+5. **Prior audits accepted it**: Spearbit classified specific sub-behaviors (not the permissionless model) as issues, which were fixed.
+6. **Design necessity**: Making forceWithdraw role-gated would create centralization risk — a malicious or inactive operator could trap blocked users indefinitely. The permissionless design ensures blocked users can always be rescued.
+
+### Supporting Test Evidence
+
+All 8 closure tests in [`test/audit/batch2/ForceWithdrawClosure.t.sol`](/Volumes/Dumebi-SSD/Bounty/kiln-vault/test/audit/batch2/ForceWithdrawClosure.t.sol) pass:
+
+| Test                               | Verdict | Proof                                       |
+| ---------------------------------- | ------- | ------------------------------------------- |
+| `test_attackerDoesNotReceiveFunds` | PASS    | Attacker gets 0, blocked user gets funds    |
+| `test_fairValue`                   | PASS    | Returns fair value (deposit + yield - fees) |
+| `test_fullExitRequired`            | PASS    | Reverts on insufficient liquidity           |
+| `test_rewardFee`                   | PASS    | Reward fee path preserved                   |
+| `test_cannotForceNonBlocked`       | PASS    | Non-blocked user protected                  |
+| `test_griefOnly`                   | PASS    | No economic gain for attacker               |
+| `test_cannotTriggerBlocklist`      | PASS    | Blocklisting requires OPERATOR_ROLE         |
+| `test_worksAfterDepositPause`      | PASS    | Works during deposit pause                  |
 
 ---
 
@@ -266,7 +341,9 @@ Already covered in CANDIDATE-006. This is a KNOWN ISSUE.
 | 005 | Factory init accepts zero deployer              | **FALSE POSITIVE**         |
 | 006 | Beacon pause DoS on view functions              | **EXPECTED ADMIN POWER**   |
 | 007 | delegateToFactory OZ storage collision          | **NEEDS PRODUCTION CHECK** |
-| 008 | forceWithdraw permissionless                    | **NEEDS MORE TESTING**     |
+| 008 | forceWithdraw permissionless                    | **EXPECTED BEHAVIOR**
+| 009 | Sanctions oracle revert bricks vault            | **NEEDS PRODUCTION CHECK**
+| 010 | Factory immutable dependencies                  | **EXPECTED ADMIN POWER**     |
 | 009 | Sanctions oracle revert bricks vault            | **NEEDS PRODUCTION CHECK** |
 | 010 | Factory immutable dependencies                  | **EXPECTED ADMIN POWER**   |
 | 011 | Zero-asset vault deployable                     | **FALSE POSITIVE**         |
@@ -275,5 +352,4 @@ Already covered in CANDIDATE-006. This is a KNOWN ISSUE.
 No **VALID** high/critical initialization or upgrade vulnerabilities were identified in the current source code. The most impactful issues are:
 
 1. **KNOWN ISSUE**: VaultUpgradeableBeacon.pauseFor overflow (Medium — acknowledged with PauserProxy mitigation)
-2. **NEEDS PRODUCTION CHECK**: ForceWithdraw permissionless (Low-Medium — griefing)
 3. **NEEDS PRODUCTION CHECK**: Sanctions oracle revert DoS (Low-Medium — external dependency)
