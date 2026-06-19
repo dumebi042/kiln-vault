@@ -134,7 +134,7 @@ contract VaultHandler is Test {
         amount = bound(amount, 10 ** 12, 10 ** 15);
         asset.mint(actor, amount);
         vm.startPrank(actor);
-        asset.approve(address(vault), amount);
+        asset.approve(address(vault), type(uint256).max);
         uint256 shares = vault.deposit(amount, actor);
         vm.stopPrank();
         if (shares > 0) {

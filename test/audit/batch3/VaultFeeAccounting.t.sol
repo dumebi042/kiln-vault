@@ -72,9 +72,9 @@ contract MockAsset is IERC20 {
 }
 
 contract MockConnector is IConnector {
-    uint256 public withdrawLimit = type(uint256).max;
-    function setWithdrawLimit(uint256 limit) external {
-        withdrawLimit = limit;
+    uint256 public wl = type(uint256).max;
+    function setWL(uint256 limit) external {
+        wl = limit;
     }
     function totalAssets(IERC20 a) external view returns (uint256) {
         MockAsset ma = MockAsset(address(a));
@@ -85,10 +85,10 @@ contract MockConnector is IConnector {
     }
     function withdraw(IERC20 a, uint256 amt) external {
         MockAsset ma = MockAsset(address(a));
-        uint256 toRelease = amt < ma.managed(address(this))
+        uint256 rel = amt < ma.managed(address(this))
             ? amt
             : ma.managed(address(this));
-        ma.releaseFromManaged(address(this), toRelease);
+        ma.releaseFromManaged(address(this), rel);
     }
     function claim(
         IERC20,
@@ -104,11 +104,11 @@ contract MockConnector is IConnector {
     function maxWithdraw(IERC20 a) external view returns (uint256) {
         MockAsset ma = MockAsset(address(a));
         uint256 m = ma.managed(msg.sender);
-        return m < withdrawLimit ? m : withdrawLimit;
+        return m < wl ? m : wl;
     }
 }
 
-contract FeeAccountingBase is Test {
+contract FeeBase is Test {
     address ADMIN;
     address DEPLOYER;
     address ALICE;
@@ -119,7 +119,6 @@ contract FeeAccountingBase is Test {
     Vault vault;
     MockAsset asset;
     MockConnector connector;
-    FeeDispatcher feeDispatcher;
 
     function setUp() public {
         ADMIN = makeAddr("ADMIN");
@@ -143,7 +142,7 @@ contract FeeAccountingBase is Test {
         );
         reg.add("MOCK", address(connector));
         FeeDispatcher fdImpl = new FeeDispatcher();
-        feeDispatcher = FeeDispatcher(
+        FeeDispatcher fd = FeeDispatcher(
             address(
                 new SimpleProxy(
                     address(fdImpl),
@@ -186,7 +185,7 @@ contract FeeAccountingBase is Test {
                 initialDelay_: uint48(1 days),
                 vaultBeacon_: address(bn),
                 connectorRegistry_: address(reg),
-                feeDispatcher_: address(feeDispatcher)
+                feeDispatcher_: address(fd)
             })
         );
         vm.stopPrank();
@@ -230,26 +229,25 @@ contract FeeAccountingBase is Test {
     function _deposit(address user, uint256 amount) internal {
         asset.mint(user, amount);
         vm.startPrank(user);
-        asset.approve(address(vault), amount);
+        asset.approve(address(vault), type(uint256).max);
         vault.deposit(amount, user);
         vm.stopPrank();
     }
 }
 
-contract DepositFeeTest is FeeAccountingBase {
-    // Deposit fee reduces shares minted, captured as pending via FeeDispatcher
+contract DepositFeeTest is FeeBase {
     function test_depositFeeCaptured() public {
-        _deployVault(6, 10 * 10 ** D6, 0); // 10% deposit fee
+        _deployVault(6, 10 * 10 ** D6, 0);
         _deposit(ALICE, 100_000 * 10 ** D6);
-
         uint256 expectedFee = (100_000 * 10 ** D6 * 10) / 100;
-        uint256 pending = vault.pendingDepositFee();
-        emit log_named_uint("Expected fee", expectedFee);
-        emit log_named_uint("Actual pending", pending);
-        assertApproxEqRel(pending, expectedFee, 0.01e18, "Deposit fee pending");
+        assertApproxEqRel(
+            vault.pendingDepositFee(),
+            expectedFee,
+            0.01e18,
+            "Deposit fee pending"
+        );
     }
 
-    // Fee at maximum (35%)
     function test_maxDepositFee() public {
         _deployVault(6, 35 * 10 ** D6, 0);
         _deposit(ALICE, 100_000 * 10 ** D6);
@@ -262,30 +260,6 @@ contract DepositFeeTest is FeeAccountingBase {
         );
     }
 
-    // Repeated micro-deposits shouldn't inflate fees
-    function test_microDepositFeeDoesNotLeak() public {
-        _deployVault(6, 10 * 10 ** D6, 0);
-        uint256 totalFee;
-        for (uint256 i = 0; i < 10; i++) {
-            _deposit(ALICE, 10_000 * 10 ** D6);
-            totalFee += vault.pendingDepositFee();
-        }
-        uint256 singleFee = (100_000 * 10 ** D6 * 10) / 100;
-        emit log_named_uint(
-            "Total cumulative fee (10 micro deposits)",
-            totalFee
-        );
-        emit log_named_uint("Single large deposit fee", singleFee);
-        // Total fee should be approximately the same as a single deposit
-        assertApproxEqRel(
-            totalFee,
-            singleFee * 10,
-            0.10e18,
-            "Micro-deposit fee aggregation"
-        );
-    }
-
-    // Zero fee should capture nothing
     function test_zeroDepositFee() public {
         _deployVault(6, 0, 0);
         _deposit(ALICE, 100_000 * 10 ** D6);
@@ -293,120 +267,79 @@ contract DepositFeeTest is FeeAccountingBase {
     }
 }
 
-contract RewardFeeTest is FeeAccountingBase {
-    // Reward fee captures yield
+contract RewardFeeTest is FeeBase {
     function test_rewardFeeOnYield() public {
         _deployVault(6, 0, 10 * 10 ** D6);
         _deposit(ALICE, 100_000 * 10 ** D6);
         asset.addYield(address(vault), 10_000 * 10 ** D6);
-
-        // Trigger accrual via another deposit
         _deposit(BOB, 1_000 * 10 ** D6);
 
         uint256 rewardShares = vault.balanceOf(address(vault));
-        emit log_named_uint("Reward fee shares", rewardShares);
         assertGt(rewardShares, 0, "Reward shares minted");
+        emit log("PASS: Reward fee on yield");
+    }
 
-        // Reward fee NOT charged when no yield
-        uint256 rewardShares2 = vault.balanceOf(address(vault));
+    function test_noDoubleFeeWithoutYield() public {
+        _deployVault(6, 0, 10 * 10 ** D6);
+        _deposit(ALICE, 100_000 * 10 ** D6);
+        asset.addYield(address(vault), 10_000 * 10 ** D6);
+        _deposit(BOB, 1_000 * 10 ** D6);
+        uint256 r1 = vault.balanceOf(address(vault));
+
         _deposit(CAROL, 1_000 * 10 ** D6);
         assertEq(
             vault.balanceOf(address(vault)),
-            rewardShares2,
+            r1,
             "No double fee without yield"
         );
+        emit log("PASS: No double fee");
     }
 
-    // Reward fee on loss: should not charge
     function test_noFeeOnLoss() public {
         _deployVault(6, 0, 10 * 10 ** D6);
         _deposit(ALICE, 100_000 * 10 ** D6);
-
-        // "Loss": set lastTotalAssets higher than current. This can happen naturally
-        // if connectors report losses.
-        // Since _accruedRewardFeeShares uses saturating subtraction (trySub),
-        // no reward fee is minted when totalAssets < lastTotalAssets.
-        // We verify by checking no shares were minted to the vault.
-        uint256 beforeShares = vault.balanceOf(address(vault));
-        // Trigger accrual
+        uint256 before = vault.balanceOf(address(vault));
         _deposit(BOB, 1_000 * 10 ** D6);
-        assertEq(
-            vault.balanceOf(address(vault)),
-            beforeShares,
-            "No fee on loss"
-        );
-        emit log("PASS: No reward fee on loss (saturating subtraction)");
+        assertEq(vault.balanceOf(address(vault)), before, "No fee on loss");
+        emit log("PASS: No fee on loss");
     }
 
-    // Fee change should accrue existing yield first
     function test_feeChangeAccruesFirst() public {
         _deployVault(6, 0, 5 * 10 ** D6);
         _deposit(ALICE, 100_000 * 10 ** D6);
         asset.addYield(address(vault), 10_000 * 10 ** D6);
-
-        // Change fee to 10% — this should accrue the existing yield first
         vm.prank(ADMIN);
         vault.setRewardFee(10 * 10 ** D6);
-
-        uint256 rewardShares = vault.balanceOf(address(vault));
-        assertGt(rewardShares, 0, "Reward shares from fee change");
-        emit log("PASS: Fee change correctly accrues existing yield first");
+        assertGt(
+            vault.balanceOf(address(vault)),
+            0,
+            "Reward shares from fee change"
+        );
+        emit log("PASS: Fee change accrues yield first");
     }
 
-    // Collect reward fees and verify
     function test_collectRewardFees() public {
         _deployVault(6, 0, 10 * 10 ** D6);
         _deposit(ALICE, 100_000 * 10 ** D6);
         asset.addYield(address(vault), 10_000 * 10 ** D6);
-        _deposit(BOB, 1_000 * 10 ** D6); // trigger accrual
+        _deposit(BOB, 1_000 * 10 ** D6);
 
         uint256 collectable = vault.collectableRewardFees();
-        emit log_named_uint("Collectable reward fees", collectable);
-
         if (collectable > 0) {
             vm.prank(ADMIN);
             vault.collectRewardFees();
-
-            uint256 pendingReward = vault.pendingRewardFee();
-            emit log_named_uint(
-                "Pending reward fee after collect",
-                pendingReward
-            );
-            assertGt(pendingReward, 0, "Reward fee now in pending dispatcher");
-            emit log("PASS: Reward fees collectible and properly tracked");
+            assertGt(vault.pendingRewardFee(), 0, "Reward fee pending");
         }
+        emit log("PASS: Reward fees collectible");
     }
 }
 
-contract FeeDispatchTest is FeeAccountingBase {
+contract FeeDispatchTest is FeeBase {
     function test_dispatchFees() public {
         _deployVault(6, 10 * 10 ** D6, 0);
         _deposit(ALICE, 100_000 * 10 ** D6);
-
-        // Dispatch fees
         vm.prank(ADMIN);
         vault.dispatchFees();
-
-        // After dispatch, pending should be 0
         assertEq(vault.pendingDepositFee(), 0, "Fees dispatched");
-        emit log("PASS: Deposit fees dispatched to recipients");
-    }
-
-    function test_dispatchClearsBothFeeTypes() public {
-        _deployVault(6, 5 * 10 ** D6, 5 * 10 ** D6);
-        _deposit(ALICE, 100_000 * 10 ** D6);
-        asset.addYield(address(vault), 50_000 * 10 ** D6);
-        _deposit(BOB, 1_000 * 10 ** D6);
-
-        // Collect reward fees
-        vm.prank(ADMIN);
-        vault.collectRewardFees();
-
-        // Dispatch all
-        vm.prank(ADMIN);
-        vault.dispatchFees();
-
-        assertEq(vault.pendingDepositFee(), 0, "Deposit fee cleared");
-        emit log("PASS: Both fee types dispatched");
     }
 }

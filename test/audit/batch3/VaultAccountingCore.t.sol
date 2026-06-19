@@ -235,7 +235,7 @@ contract Batch3AccountingBase is Test {
     function _deposit(address user, uint256 amount) internal {
         asset.mint(user, amount);
         vm.startPrank(user);
-        asset.approve(address(vault), amount);
+        asset.approve(address(vault), type(uint256).max);
         vault.deposit(amount, user);
         vm.stopPrank();
     }

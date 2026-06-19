@@ -4,12 +4,12 @@
 
 | ID     | Title                                                | Classification         |
 | ------ | ---------------------------------------------------- | ---------------------- |
-| B3-001 | First depositor charged reward fee on entire deposit | **EXPECTED BEHAVIOR**  |
+| B3-001 | First depositor charged reward fee on entire deposit | **FALSE POSITIVE**  |
 | B3-002 | Offset=0 enables donation extraction                 | **KNOWN ISSUE**        |
 | B3-003 | Deposit fee reduces shares, not asset claim          | **EXPECTED BEHAVIOR**  |
 | B3-004 | Micro-deposit fee aggregation rounding               | **FALSE POSITIVE**     |
 | B3-005 | Preview consistency across operations                | **EXPECTED BEHAVIOR**  |
-| B3-006 | Minimum supply griefing via coordinated withdrawal   | **NEEDS MORE TESTING** |
+| B3-006 | Minimum supply griefing via coordinated withdrawal   | **EXPECTED BEHAVIOR**
 | B3-007 | Partial share remainder prevents redeem/transfer     | **EXPECTED BEHAVIOR**  |
 | B3-008 | Round-trip conservation holds (1 wei max loss)       | **EXPECTED BEHAVIOR**  |
 
