@@ -1,0 +1,9 @@
+[
+  {
+    "path": "src/interfaces/IConnector.sol",
+    "previousOrigin": "SDAIConnector.json",
+    "nextOrigin": "SUSDSConnector.json",
+    "previousHash": "470adb54c6f04460bf5304ea601ea7ff2ebab6ae2141796f7732de9fa9054d3f",
+    "nextHash": "bbb59c80493b2503f7180e2fc54c5afe301a6409c99c1af13ae5a9b604bdf6d4"
+  }
+]
