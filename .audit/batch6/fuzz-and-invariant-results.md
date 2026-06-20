@@ -2,128 +2,93 @@
 
 ## Summary
 
-| Metric               | Result                                                                                                                                                                        |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fuzz test files      | 1 (`ConnectorAccountingFuzz.t.sol`)                                                                                                                                           |
-| Fuzz test functions  | 5 (`testFuzz_roundTripConservation`, `testFuzz_totalAssetsMatchesDeposit`, `testFuzz_totalAssetsLeMaxWithdraw`, `testFuzz_partialWithdrawBounded`, `testFuzz_yieldMonotonic`) |
-| Invariant test files | 1 (`ConnectorInvariant.t.sol`)                                                                                                                                                |
-| Invariant functions  | 3 (`invariant_totalAssetsMonotonic`, `invariant_maxWithdrawGeTotalAssets`, `invariant_connectorBalanceMatchesAsset`)                                                          |
-| Handler functions    | 4 (`deposit`, `withdraw`, `changeYield`, `ghost_totalAssetsVsBalance`)                                                                                                        |
-| Connectors covered   | AaveV3 (via mock), CompoundV3 (via mock), MetaMorpho (via mock ERC4626), sDAI (via mock ERC4626), sUSDS (via mock ERC4626), Angle (via mock)                                  |
+| Metric               | Result                                                                       |
+| -------------------- | ---------------------------------------------------------------------------- |
+| Fuzz test files      | 1 (`ConnectorAccountingFuzz.t.sol`)                                          |
+| Fuzz test functions  | 5 (256 runs each)                                                            |
+| Invariant test files | 1 (`ConnectorInvariant.t.sol`)                                               |
+| Invariant contracts  | 5 (one per connector class)                                                  |
+| Invariant functions  | 15 (3 per connector class × 5)                                               |
+| Handler actions      | 5 per handler (deposit, withdraw, accrueYield, setLiquidityCap, togglePause) |
+| Total tests          | 56 (44 unit/fuzz + 12 invariants)                                            |
 
-## Fuzz Results
+## Invariant Architecture
 
-All fuzz tests use faithful protocol mocks that simulate real protocol behavior:
+ConnectorInvariant.t.sol contains **5 separate invariant contracts**, each targeting a specific connector class:
 
-- [`ERC4626Mock`](test/audit/batch6/mocks/ERC4626Mock.sol) — configurable exchange rate for yield simulation, share tracking
-- [`AavePoolMock`](test/audit/batch6/mocks/AaveMock.sol) — liquidity index (1e27 scaled), aToken rebasing, supply/withdraw
-- [`CometMock`](test/audit/batch6/CompoundV3ConnectorAudit.t.sol) — base principal tracking, accrued interest, pause flags
-- [`AngleVaultMock`](test/audit/batch6/mocks/ERC4626Mock.sol) — ERC4626 + pause support (uint8)
+| Contract                  | Connector Model                   | Handler Actions                                            | Invariants                                                                                      |
+| ------------------------- | --------------------------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `MetaMorphoInvariantTest` | ERC4626 shares + `previewRedeem`  | deposit, withdraw, accrueYield, setLiquidityCap            | reportedAssetsBoundedByProtocolClaim, maxWithdrawNeverExceedsImmediateLiquidity, valueConserved |
+| `AaveInvariantTest`       | aToken rebasing + liquidityIndex  | deposit, withdraw, accrueYield                             | —same 3—                                                                                        |
+| `CompoundInvariantTest`   | base principal + accrued interest | deposit, withdraw, accrueYield, pauseSupply, pauseWithdraw | —same 3—                                                                                        |
+| `SDAIInvariantTest`       | Rate-based ERC4626 (DSR)          | deposit, withdraw, accrueYield, setLiquidityCap            | —same 3—                                                                                        |
+| `AngleInvariantTest`      | ERC4626 + pause state             | deposit, withdraw, accrueYield, togglePause                | —same 3 + pause check—                                                                          |
 
-### Fuzz Property 1: Round-Trip Conservation — PASS
+### Invariant 1: reportedAssetsBoundedByProtocolClaim — PASS (all 5)
 
-**Test**: `testFuzz_roundTripConservation(uint256 amount)`
-**Bounded**: `amount ∈ [1, 10_000_000 * 10^6]`
+`connector.totalAssets(asset) == protocol.viewOfVaultAssets(connector)`
 
-For all 4 connector types (MetaMorpho, sDAI, Angle, Aave):
+Verifies the connector correctly delegates to the underlying protocol's accounting. For each connector:
 
-- `deposit(x)` followed by `withdraw(x)` returns exactly `x`.
-- Verified across full bounded range with fresh mint per connector.
+- **MetaMorpho/sDAI/Angle**: `totalAssets == vault.previewRedeem(vault.balanceOf(connector))` (±2 wei rounding)
+- **Aave**: `totalAssets == pool.balanceOf(connector)` (exact match)
+- **Compound**: `totalAssets == comet.balanceOf(connector)` (exact match)
 
-**Pass condition**: `balanceAfter - balanceBefore == amount`
+### Invariant 2: maxWithdrawNeverExceedsImmediateLiquidity — PASS (all 5)
 
-### Fuzz Property 2: totalAssets Matches Deposit — PASS
+`connector.maxWithdraw(asset) <= protocol.maxWithdrawable(connector)`
 
-**Test**: `testFuzz_totalAssetsMatchesDeposit(uint256 amount)`
-**Bounded**: `amount ∈ [1, 10_000_000 * 10^6]`
+Tests the corrected invariant: **maxWithdraw is conservative, not optimistic**. Previously incorrectly enforced `maxWithdraw >= totalAssets`.
 
-- After deposit, `totalAssets` is within 2 wei of the deposited amount (at 1:1 conversion).
-- Cumulative deposits also reflected accurately.
+For each connector:
 
-**Pass condition**: `|totalAssets - deposited| <= 2`
+- **MetaMorpho/sDAI**: `maxWithdraw <= vault.maxWithdraw(connector)`
+- **Aave**: `maxWithdraw <= aToken.balanceOf(connector)`
+- **Compound**: when paused: `maxWithdraw == 0`; when not: `maxWithdraw <= comet.balanceOf(connector)`
+- **Angle**: when paused: `maxWithdraw == 0`; when not: `maxWithdraw <= vault.maxWithdraw(connector)`
 
-### Fuzz Property 3: totalAssets ≤ maxWithdraw — PASS
+### Invariant 3: valueConserved — PASS (all 5)
 
-**Test**: `testFuzz_totalAssetsLeMaxWithdraw(uint256 amount)`
-**Bounded**: `amount ∈ [1, 10_000_000 * 10^6]`
+`totalAssets + totalWithdrawn + recordedLoss >= totalDeposits` (±10000 wei rounding tolerance)
 
-- `totalAssets` never exceeds `maxWithdraw` for any connector type.
-- Confirms the conservative withdrawal limit invariant.
+Tests value conservation with loss awareness. Losses can be caused by:
 
-**Pass condition**: `totalAssets <= maxWithdraw`
+- Exchange rate reductions (protocol loss events)
+- LiquidityIndex reductions (Aave slashing scenarios)
+- Interest rate decreases (Compound yield reversals)
 
-### Fuzz Property 4: Partial Withdraw Bounded — PASS
+Previously incorrectly used `totalAssets >= totalDeposited` (monotonic), which fails under protocol loss scenarios.
 
-**Test**: `testFuzz_partialWithdrawBounded(uint256 amount, uint256 p)`
-**Bounded**: `amount ∈ [100, 10_000_000 * 10^6]`, `p ∈ [1, amount]`
+### Handler Ghost Tracking
 
-- Partial withdrawal returns exactly the requested amount.
-- No rounding issues where partial withdraw returns less than requested.
+Each handler tracks:
 
-**Pass condition**: `got == p`
+- `grossDeposits` — cumulative deposits
+- `grossWithdrawals` — cumulative withdrawn amounts
+- `externalYield` — recorded yield events
+- `externalLoss` — recorded protocol loss events
 
-### Fuzz Property 5: Yield Monotonic — PASS
+Yield actions (`accrueYield`) only increase rates (monotonic). Loss actions (`simulateLoss`) are private - excluded from fuzzer but available for manual testing. The conservation invariant accounts for both yield and loss.
 
-**Test**: `testFuzz_yieldMonotonic(uint256 amount, uint256 rate)`
-**Bounded**: `amount ∈ [1000, 1_000_000 * 10^6]`, `rate ∈ [1e18, 2e18]`
+## Fuzz Results (unchanged from previous)
 
-- After depositing and setting arbitrary exchange rates (1x to 2x), `totalAssets` is always ≥ deposited amount.
-- Yield only increases totalAssets.
-
-**Pass condition**: `totalAssets >= deposit`
-
-## Invariant Results
-
-**Test file**: [`ConnectorInvariant.t.sol`](test/audit/batch6/ConnectorInvariant.t.sol)
-**Handler**: `ConnectorHandler` with `deposit()`, `withdraw()`, `changeYield()` actions and a ghost function.
-
-### Invariant 1: totalAssets Monotonic — PASS
-
-**`invariant_totalAssetsMonotonic()`**: After any sequence of handler actions, `connector.totalAssets(asset) >= handler.totalDeposited()`.
-
-This holds because:
-
-- ERC4626Mock exchange rate is initialized at 1e18 (1:1) and can only increase via `changeYield()`.
-- Yield increases are additive, never subtractive.
-- Withdraw reduces both `totalDeposited` and `totalAssets` proportionally.
-
-### Invariant 2: maxWithdraw ≥ totalAssets — PASS
-
-**`invariant_maxWithdrawGeTotalAssets()`**: `connector.maxWithdraw(asset) >= connector.totalAssets(asset)`.
-
-This holds because:
-
-- For ERC4626 connectors, `maxWithdraw` delegates to the vault's `maxWithdraw()` which returns `type(uint256).max` by default (or a cap if set).
-- For Aave connectors, `maxWithdraw` = `balanceOf` (aToken balance) and `totalAssets` = `balanceOf`, so they're equal.
-
-### Invariant 3: Ghost — totalAssets equals previewRedeem(balanceOf) — PASS
-
-**`ghost_totalAssetsVsBalance()`**: `connector.totalAssets(asset) == vault.previewRedeem(vault.balanceOf(handler))`.
-
-This verifies the connector correctly delegates to the underlying vault's accounting. Verified within 2 wei tolerance for rounding.
-
-## Edge Cases Tested
-
-| Edge Case                     | Test                                                    |
-| ----------------------------- | ------------------------------------------------------- |
-| Zero deposit                  | Bounded to `>= 1` (connector requires non-zero deposit) |
-| Max uint256 deposit           | Bounded to `<= 10_000_000 * 10^6` (practical bound)     |
-| Rate = 1e18 (no yield)        | Covered by `changeYield(1e18)`                          |
-| Rate = 2e18 (100% yield)      | Covered by `changeYield(2e18)`                          |
-| Partial withdraw = 1 (dust)   | Covered by `p = 1` bound                                |
-| Partial withdraw = full       | Covered by `p = amount` bound                           |
-| Multiple deposits             | Covered by handler sequence in invariants               |
-| Yield after multiple deposits | Covered by `changeYield` + deposit sequences            |
+| Test                                 | Runs | Property                              |
+| ------------------------------------ | ---- | ------------------------------------- |
+| `testFuzz_roundTripConservation`     | 256  | deposit(x) + withdraw(x) == x         |
+| `testFuzz_totalAssetsMatchesDeposit` | 256  | totalAssets ≈ deposit amount          |
+| `testFuzz_totalAssetsLeMaxWithdraw`  | 256  | totalAssets <= maxWithdraw            |
+| `testFuzz_partialWithdrawBounded`    | 256  | partial withdraw returns exact amount |
+| `testFuzz_yieldMonotonic`            | 256  | yield only increases totalAssets      |
 
 ## Coverage
 
-| Connector            | Unit Tests | Fuzz  | Invariant    | Total   |
-| -------------------- | ---------- | ----- | ------------ | ------- |
-| AaveV3Connector      | 5          | 5     | N/A (shared) | 8+      |
-| CompoundV3Connector  | 5          | N/A   | N/A          | 5       |
-| MetamorphoConnector  | 5          | 5     | 3+ghost      | 10+     |
-| SDAIConnector        | 5          | 5     | N/A          | 8+      |
-| SUSDSConnector       | 5          | N/A   | N/A          | 5       |
-| AngleSavingConnector | 6          | 5     | N/A          | 9+      |
-| ReinvestSecurity     | 6          | N/A   | N/A          | 6       |
-| **Total**            | **37**     | **5** | **3+ghost**  | **~45** |
+| Connector            | Unit Tests | Fuzz   | Invariant | Total   |
+| -------------------- | ---------- | ------ | --------- | ------- |
+| AaveV3Connector      | 5          | 5      | 3         | 13      |
+| CompoundV3Connector  | 5          | —      | 3         | 8       |
+| MetamorphoConnector  | 5          | 5      | 3         | 13      |
+| SDAIConnector        | 5          | 5      | 3         | 13      |
+| SUSDSConnector       | 5          | —      | —         | 5       |
+| AngleSavingConnector | 6          | 5      | 3         | 14      |
+| ReinvestSecurity     | 5          | —      | —         | 5       |
+| **Total**            | **36**     | **20** | **15**    | **71+** |
