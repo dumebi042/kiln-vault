@@ -253,12 +253,11 @@ The `_deposit` function uses `balanceOf(vault) - balanceBefore - depositFee` whi
 
 ### 8.1 First Deposit Fee Capture (Informational)
 
-When `_lastTotalAssets = 0` and `rewardFee > 0`, the first depositor is charged a reward fee on their entire deposit. This is because `_lastTotalAssets` starts at 0, and the increase to the deposit amount is treated as "yield."
+### 8.1 First Deposit Fee Capture — FALSE POSITIVE (Informational)
 
-**Impact**: The first depositor receives fewer shares than subsequent depositors for the same asset amount. This is a one-time effect that disappears once `_lastTotalAssets` is set to the actual total after the first deposit.
+When `_lastTotalAssets = 0` and `rewardFee > 0`, one might expect the first depositor to be charged a reward fee. However, `_accrueRewardFee()` is called BEFORE the asset transfer (Vault.sol L521), so `totalAssets()` returns 0 and `reward = 0`. No fee is charged on the first deposit.
 
-**Classification**: EXPECTED BEHAVIOR. The vault should set `_lastTotalAssets = totalAssets()` after initialization to avoid this.
-
+**Classification**: FALSE POSITIVE. The execution order (`_accrueRewardFee` before asset transfer) prevents this.
 ### 8.2 Deposit Fee Not Reflected in totalAssets (Informational)
 
 The deposit fee stays as idle balance in the vault. `totalAssets()` includes this (via `balanceOf(vault)`), but the fee is NOT accessible to shareholders — it's owed to fee recipients.

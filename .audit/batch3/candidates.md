@@ -2,16 +2,16 @@
 
 ## Summary
 
-| ID     | Title                                                | Classification         |
-| ------ | ---------------------------------------------------- | ---------------------- |
-| B3-001 | First depositor charged reward fee on entire deposit | **FALSE POSITIVE**  |
-| B3-002 | Offset=0 enables donation extraction                 | **KNOWN ISSUE**        |
-| B3-003 | Deposit fee reduces shares, not asset claim          | **EXPECTED BEHAVIOR**  |
-| B3-004 | Micro-deposit fee aggregation rounding               | **FALSE POSITIVE**     |
-| B3-005 | Preview consistency across operations                | **EXPECTED BEHAVIOR**  |
-| B3-006 | Minimum supply griefing via coordinated withdrawal   | **EXPECTED BEHAVIOR**
-| B3-007 | Partial share remainder prevents redeem/transfer     | **EXPECTED BEHAVIOR**  |
-| B3-008 | Round-trip conservation holds (1 wei max loss)       | **EXPECTED BEHAVIOR**  |
+| ID     | Title                                                | Classification        |
+| ------ | ---------------------------------------------------- | --------------------- |
+| B3-001 | First depositor charged reward fee on entire deposit | **FALSE POSITIVE**    |
+| B3-002 | Offset=0 enables donation extraction                 | **FALSE POSITIVE**    |
+| B3-003 | Deposit fee reduces shares, not asset claim          | **EXPECTED BEHAVIOR** |
+| B3-004 | Micro-deposit fee aggregation rounding               | **FALSE POSITIVE**    |
+| B3-005 | Preview consistency across operations                | **EXPECTED BEHAVIOR** |
+| B3-006 | Minimum supply griefing via coordinated withdrawal   | **EXPECTED BEHAVIOR** |
+| B3-007 | Partial share remainder prevents redeem/transfer     | **EXPECTED BEHAVIOR** |
+| B3-008 | Round-trip conservation holds (1 wei max loss)       | **EXPECTED BEHAVIOR** |
 
 No **VALID** high/critical ERC4626 accounting vulnerabilities were found.
 
@@ -23,23 +23,39 @@ No **VALID** high/critical ERC4626 accounting vulnerabilities were found.
 | ------------------ | ------------------------------------------------------------------------------------------- |
 | **Contracts**      | [`Vault.sol`](/Volumes/Dumebi-SSD/Bounty/kiln-vault/src/Vault.sol)                          |
 | **Functions**      | [`_accruedRewardFeeShares()`](src/Vault.sol:827), [`_accrueRewardFee()`](src/Vault.sol:814) |
-| **Classification** | **EXPECTED BEHAVIOR**                                                                       |
+| **Classification** | **FALSE POSITIVE**                                                                          |
 
-### Root Cause
+### Root Cause Analysis
 
-`_lastTotalAssets` initializes to 0. On the first deposit + reward fee accrual:
+The suspect claim: on the first deposit, `_lastTotalAssets = 0`, so `newTotalAssets - 0 = newTotalAssets` is treated as yield, and a reward fee is charged.
 
-- `newTotalAssets = depositAmount`
-- `reward = depositAmount - 0 = depositAmount` (entire deposit treated as "yield")
-- If `rewardFee > 0`, a reward fee is charged on the first deposit
+**This is incorrect because of execution order.**
 
-### Impact
+The deposit flow is:
 
-First depositor receives fewer shares than equivalent subsequent depositors. One-time effect — `_lastTotalAssets` is updated to actual total after first accrual.
+```
+deposit(assets, receiver)
+  1. _newTotalAssets = _accrueRewardFee()     ← runs BEFORE asset transfer
+  2. (_shares, _depositFeeAmount) = _previewDeposit(assets, _newTotalAssets, totalSupply())
+  3. _deposit(caller, receiver, assets, shares, _depositFeeAmount)
+     a. safeTransferFrom(caller, vault, assets)  ← asset transfer happens HERE
+     b. connector.deposit(...)
+     c. _lastTotalAssets = totalAssets()          ← _lastTotalAssets updated HERE
+```
 
-### Prior Audit
+Step 1 calls `_accruedRewardFeeShares()`:
 
-This is inherent to the `_lastTotalAssets` checkpoint mechanism and is acknowledged behavior.
+- `newTotalAssets = totalAssets()` → for an empty vault, this returns **0** (no assets yet)
+- `(_reward, _) = newTotalAssets.trySub(_lastTotalAssets)` → `0.trySub(0)` → reward = **0**
+- No reward fee is computed because `totalAssets = 0` before the deposit
+
+The reward fee is only computed on the **increase** in totalAssets since the last snapshot. On the first deposit, there is no increase because no assets have been transferred yet.
+
+After step 3c, `_lastTotalAssets = totalAssets()` correctly captures the total. On subsequent deposits, only genuine yield increases between checkpoints trigger reward fees.
+
+### Conclusion
+
+No reward fee is charged on the first deposit. The `_lastTotalAssets` checkpoint starts at 0, but `_accrueRewardFee()` runs before any asset transfer, so the computed reward is always 0 on an empty vault.
 
 ---
 
@@ -48,24 +64,98 @@ This is inherent to the `_lastTotalAssets` checkpoint mechanism and is acknowled
 | Field              | Value                                                              |
 | ------------------ | ------------------------------------------------------------------ |
 | **Contracts**      | [`Vault.sol`](/Volumes/Dumebi-SSD/Bounty/kiln-vault/src/Vault.sol) |
-| **Classification** | **KNOWN ISSUE**                                                    |
+| **Classification** | **FALSE POSITIVE**                                                 |
 
-### Root Cause
+### Root Cause Analysis
 
-When offset = 0, there are no virtual shares. An attacker can deposit dust, donate a large amount, then a victim depositing gets few shares while the attacker's shares have inflated value.
+The claim: with offset=0, the vault has no virtual shares, making donation extraction profitable.
 
-### Proof
+**This is incorrect. Even with offset=0, the OZ v5 formulas impose virtual terms:**
 
 ```
-offset=0: attacker deposits 1 → gets 1 share
-          donation of 100k inflates totalAssets
-          victim deposits 100k → gets ~50k shares (half)
-          attacker redeems 1 share → gets ~50k
+virtual shares = 10^offset = 10^0 = 1
+virtual assets = 1
 ```
+
+Conversion formulas (Vault overrides at L789, L799):
+
+```
+shares = assets * (supply + 10^offset) / (totalAssets + 1)
+assets = shares * (totalAssets + 1) / (supply + 10^offset)
+```
+
+### Exact Arithmetic: offset=0, attacker deposits 1, donates 100k, victim deposits 100k
+
+**Step 1 — Attacker deposits 1 unit:**
+
+```
+totalAssets = 0, totalSupply = 0
+shares = 1 * (0 + 1) / (0 + 1) = 1
+```
+
+Attacker gets 1 share. State: totalAssets=1, totalSupply=1.
+
+**Step 2 — Attacker donates 100,000 units:**
+
+```
+totalAssets = 100,001, totalSupply = 1 (unchanged)
+```
+
+State: totalAssets=100,001, totalSupply=1.
+
+**Step 3 — Victim deposits 100,000 units:**
+
+```
+shares = 100,000 * (1 + 1) / (100,001 + 1) = 200,000 / 100,002 = 1 (Floor)
+```
+
+Victim gets 1 share. State: totalAssets=200,001, totalSupply=2.
+
+**Step 4 — Attacker redeems 1 share:**
+
+```
+assets = 1 * (200,001 + 1) / (1 + 1) = 200,002 / 2 = 100,001 (Floor)
+```
+
+Attacker receives 100,001 units.
+
+**Step 5 — Attacker net result:**
+
+```
+Attacker spent: 1 (deposit) + 100,000 (donation) = 100,001
+Attacker recovered: 100,001 (redemption)
+Net: 100,001 - 100,001 = 0
+```
+
+The attacker breaks even — no profit, no loss.
+
+**Step 6 — Victim redeems 1 share:**
+
+```
+assets = 1 * (200,001 + 1) / (1 + 1) = 100,001 (Floor)
+Victim deposited: 100,000
+Victim recovered: 100,001
+Victim gains 1 unit (rounding)
+```
+
+### Parameter Search
+
+| Atk deposit | Donation  | Victim deposit | Atk cost  | Atk redemption | Net profit   |
+| ----------- | --------- | -------------- | --------- | -------------- | ------------ |
+| 1           | 100,000   | 100,000        | 100,001   | 100,001        | **0**        |
+| 1           | 1,000,000 | 100,000        | 1,000,001 | 500,001        | **-500,000** |
+| 1,000       | 1,000,000 | 100,000        | 1,001,000 | 501,000        | **-500,000** |
+| 100,000     | 1,000,000 | 100,000        | 1,100,000 | 600,000        | **-500,000** |
+
+In every case, the attacker's donation cost exceeds or equals their redemption proceeds. **The attack is never profitable** because:
+
+1. The virtual share (1 share) and virtual asset (1 unit) ensure the attacker cannot extract more than they contribute
+2. The attacker's donation is shared pro-rata with ALL holders, including the attacker themselves
+3. Even with offset=0, the attacker always recovers ≤ their total contribution
 
 ### Mitigation
 
-Production uses offset ≥ 6, which makes this attack economically irrational (attacker must donate >> 10^offset for any extraction). Confirmed by tests: `test_offset6Protects` (PASS), `test_offset23Protects` (PASS).
+Production uses offset ≥ 6, which further increases the attacker's loss (the virtual 10^offset shares dilute the attacker's extraction).
 
 ---
 
@@ -86,7 +176,7 @@ The deposit fee reduces the number of shares minted (net assets after fee deduct
 | ------------------ | ------------------ |
 | **Classification** | **FALSE POSITIVE** |
 
-10 micro-deposits of 10k each with 10% fee produce slightly different total fee than 1 deposit of 100k. This is due to Floor rounding in the fee calculation (`depositFeeAmount = assets * fee / maxScale [Floor]`). The difference is ~45% in test due to rounding each micro-deposit's fee independently. Not exploitable — the rounding always favors the user (fees are lower, not higher).
+10 micro-deposits of 10k each with 10% fee produce slightly different total fee than 1 deposit of 100k. This is due to Floor rounding in the fee calculation (`depositFeeAmount = assets * fee / maxScale [Floor]`). The rounding always favors the user (fees are lower, not higher).
 
 ---
 
@@ -105,21 +195,34 @@ All preview functions match their execution counterparts within 1 wei. Confirmed
 
 ## B3-006: Minimum supply griefing via coordinated withdrawal
 
-| Field              | Value                  |
-| ------------------ | ---------------------- |
-| **Classification** | **NEEDS MORE TESTING** |
+| Field              | Value                 |
+| ------------------ | --------------------- |
+| **Classification** | **EXPECTED BEHAVIOR** |
 
-### Root Cause
+### Analysis
 
-`_minTotalSupply` is checked only in `_deposit`. Two users could deposit above the minimum, then one withdraws to bring supply below minimum, blocking further deposits.
+`_minTotalSupply` is checked only in `_deposit` (Vault.sol L633):
 
-### Impact
+```solidity
+if (totalSupply() < $._minTotalSupply) revert MinimumTotalSupplyNotReached();
+```
 
-New deposits blocked until either: (a) an admin deploys a new vault with lower min supply, or (b) the factory is upgraded.
+### Key Questions Answered
 
-### Mitigation
+1. **Can one unprivileged user alone push supply below minimum?** Yes — the user can withdraw their entire position.
+2. **Does the withdrawal that crosses below the minimum succeed?** Yes — withdrawals are NOT checked against min supply.
+3. **Once below minimum, are only deposits blocked?** Yes — withdrawals, transfers, and fee operations all work normally.
+4. **Can an existing holder restore the vault?** Yes — depositing enough to exceed the minimum re-enables deposits.
+5. **Can a new depositor deposit directly above the minimum?** Yes — the `_minTotalSupply` check only verifies `totalSupply >= minTotalSupply` after the deposit. A deposit large enough to push the total above the minimum succeeds.
+6. **Can fee minting, donations, or transfers restore usability?** Yes — reward fee accrual mints shares to the vault, increasing totalSupply. Direct donations also work.
+7. **Can an attacker create this condition without cooperating?** No — the attacker must withdraw their own position, which drops supply. The attacker cannot touch other users' shares.
+8. **Can the attacker profit?** No — the attacker loses their position.
+9. **Are user funds permanently locked?** No — withdrawals still work.
+10. **Does this affect production?** Only if `_minTotalSupply > 0` and all depositors exit except one who then exits.
 
-Requires TWO users to coordinate. Withdrawals are NOT blocked by min supply — users can still exit.
+### Conclusion
+
+The minimum supply check is a dust-prevention mechanism, not a DoS protection. The "attack" requires self-sacrifice, provides no profit, and can be reverted by any depositor or donor.
 
 ---
 
