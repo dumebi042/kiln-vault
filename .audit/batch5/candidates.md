@@ -12,40 +12,83 @@
 | B5-006 | Fee dispatch requires vault approval                    | **EXPECTED BEHAVIOR** |
 | B5-007 | Recipient split rounding dust                           | **EXPECTED BEHAVIOR** |
 
-## B5-005: Pending fee solvency after shareholder exit (Resolved)
+---
 
-**Classification**: EXPECTED BEHAVIOR
+## B5-001: Deposit fee assets isolated from shareholder withdrawal
 
-### Numerical Proof
+| Field                  | Value                                                                                                                                                                      |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Affected functions** | `_deposit()` L624, `_maxRedeem()` L707, `maxRedeem()` L464                                                                                                                 |
+| **Root cause**         | Deposit fee stays as idle vault balance, not invested via connector. `maxRedeem()` is limited by `connector.maxWithdraw()` which only returns connector-accessible assets. |
+| **Test**               | `test_feeAssetsProtectedByMaxRedeem` — PASS                                                                                                                                |
+| **Impact**             | Fee assets cannot be withdrawn by shareholders. Protected.                                                                                                                 |
+| **Classification**     | **EXPECTED BEHAVIOR**                                                                                                                                                      |
 
-Test `test_shareholderExitsAfterDepositFee`:
+---
 
-- Alice deposits 100k with 10% deposit fee
-- 10k fee idle, 90k invested through connector
-- `maxRedeem(Alice)` returns ~81k (limited by connector's `maxWithdraw` of 90k)
-- Alice's actual share balance is ~90k (in share terms)
-- `assertLt(maxRedeem, shares, ...)` PASSES — Alice CANNOT fully exit
-- Total supply remains > 0 — fee cannot be stranded without a shareholder
+## B5-002: Reward fee checkpoint prevents double-charge
 
-**The contradiction is resolved**: Shareholders cannot fully exit while pending fees remain because `maxRedeem()` is limited by the connector's `maxWithdraw()`, which excludes idle fee assets. The fee assets are always backed by idle balance equal to or greater than the pending liability.
+| Field                  | Value                                                                                    |
+| ---------------------- | ---------------------------------------------------------------------------------------- |
+| **Affected functions** | `_accruedRewardFeeShares()` L827, `_accrueRewardFee()` L814                              |
+| **Root cause**         | `_lastTotalAssets` is updated after each accrual. No new fee without new yield increase. |
+| **Tests**              | `test_noDoubleFeeOnSameYield` — PASS, `test_noFeeOnPrincipal` — PASS                     |
+| **Impact**             | No double-charge. No fee on principal or losses.                                         |
+| **Classification**     | **EXPECTED BEHAVIOR**                                                                    |
 
-### When can fees become undercollateralized?
+---
 
-Only if:
+## B5-003: FeeDispatcher multi-vault isolation
 
-1. A connector reports more `maxWithdraw()` than actual recoverable assets, AND
-2. Shareholders withdraw those over-reported assets, consuming the idle fee backing
+| Field                  | Value                                                                             |
+| ---------------------- | --------------------------------------------------------------------------------- |
+| **Affected functions** | FeeDispatcher `_dispatches[msg.sender]`                                           |
+| **Root cause**         | All state keyed by `msg.sender`. Vault A cannot access Vault B's state.           |
+| **Tests**              | `test_vaultStateIsolated` — PASS, `test_maliciousEOACannotModifyVaultFees` — PASS |
+| **Impact**             | Cross-vault fee theft impossible. EOA calls create isolated state (harmless).     |
+| **Classification**     | **EXPECTED BEHAVIOR**                                                             |
 
-This requires a malfunctioning connector (admin power scenario).
+---
+
+## B5-004: Deposit fee round-trip dust accumulation
+
+| Field              | Value              |
+| ------------------ | ------------------ |
+| **Classification** | **FALSE POSITIVE** |
+
+Floor rounding in fee calculation means each micro-deposit loses <1 unit to rounding. Bounded by number of deposits. Always favors user (lower fee). Fuzz verified.
+
+---
+
+## B5-005: Pending fee solvency after shareholder exit
+
+| Field                  | Value                                                                                                                                      |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Affected functions** | `_maxRedeem()` L707, `_withdraw()` L656, `dispatchFees()` in FeeDispatcher L129                                                            |
+| **Root cause**         | `maxRedeem()` limits shareholder withdrawal to connector-accessible assets. Idle fee balance is excluded from `connector.maxWithdraw()`.   |
+| **Test**               | `test_shareholderExitsAfterDepositFee` — PASS                                                                                              |
+| **Numerical proof**    | Alice deposits 100k (10% fee): 10k fee idle, 90k invested. `maxRedeem(Alice)` returns ~81k < Alice's ~90k shares. Alice CANNOT fully exit. |
+| **Impact**             | Fee always backed by idle balance ≥ pending fee. Only becomes undercollateralized if connector over-reports `maxWithdraw()` (admin power). |
+| **Classification**     | **EXPECTED BEHAVIOR**                                                                                                                      |
+
+---
 
 ## B5-006: Fee dispatch requires vault approval
 
-The FeeDispatcher uses `safeTransferFrom(vault, recipient, amount)` during dispatch. The vault must have approved the FeeDispatcher for the asset. This approval is set during vault initialization (`forceApprove(feeDispatcher, type(uint256).max)`) and persists indefinitely.
+| Field                  | Value                                                                                                         |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------- |
+| **Affected functions** | FeeDispatcher `dispatchFees()`, Vault `__Vault_upgrade()` L416                                                |
+| **Root cause**         | Dispatch uses `safeTransferFrom(vault, recipient, amount)`. Vault approves FeeDispatcher for max during init. |
+| **Classification**     | **EXPECTED BEHAVIOR**                                                                                         |
 
-**Classification**: EXPECTED BEHAVIOR.
+---
 
 ## B5-007: Recipient split rounding dust
 
-When multiple recipients exist, `_pendingDepositFee * split_i / maxScale [Floor]` for each recipient may leave a remainder. This remainder stays as pending balance in the FeeDispatcher, accumulating until the next dispatch. The dust is bounded by `number_of_recipients * maxScale` and is always returned to future dispatches.
-
-**Classification**: EXPECTED BEHAVIOR.
+| Field                  | Value                                                                                                                               |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| **Affected functions** | FeeDispatcher `dispatchFees()` recipient loop                                                                                       |
+| **Root cause**         | `pendingFee * split_i / maxScale [Floor]` leaves remainder for multi-recipient configurations.                                      |
+| **Fuzz proof**         | 2 recipients: dust < 2 per dispatch. 3 recipients: dust < 3 per dispatch. Repeated dispatch: dust accumulates linearly but bounded. |
+| **Impact**             | Dust remains in pending state. Can be dispatched in future cycles when additional fees accumulate. Not permanently trapped.         |
+| **Classification**     | **EXPECTED BEHAVIOR**                                                                                                               |
