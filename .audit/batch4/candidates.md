@@ -2,69 +2,134 @@
 
 ## Summary
 
-| ID     | Title                                                         | Classification           |
-| ------ | ------------------------------------------------------------- | ------------------------ |
-| B4-001 | Shares minted before connector deposit (read-only reentrancy) | **EXPECTED BEHAVIOR**    |
-| B4-002 | Balance-delta withdrawal protects against partial returns     | **EXPECTED BEHAVIOR**    |
-| B4-003 | Connector update preserves existing positions                 | **EXPECTED BEHAVIOR**    |
-| B4-004 | Deposit fee idle balance is not invested                      | **EXPECTED BEHAVIOR**    |
-| B4-005 | Fee-on-transfer tokens not fully supported                    | **OUT OF SCOPE**         |
-| B4-006 | Delegated connector can corrupt vault storage                 | **EXPECTED ADMIN POWER** |
-| B4-007 | Reinvest swapTarget retains max approval                      | **EXPECTED ADMIN POWER** |
-| B4-008 | Connector naming collision in registry                        | **EXPECTED ADMIN POWER** |
-
-No **VALID** vulnerabilities found in the asset flow or connector code.
+| ID     | Title                                                                  | Classification             |
+| ------ | ---------------------------------------------------------------------- | -------------------------- |
+| B4-001 | Shares minted before connector deposit                                 | **EXPECTED BEHAVIOR**      |
+| B4-002 | Short withdrawal: shares burned for full value, connector returns less | **NEEDS PRODUCTION CHECK** |
+| B4-003 | Connector replacement with incompatible market                         | **EXPECTED ADMIN POWER**   |
+| B4-004 | Deposit fee idle balance                                               | **EXPECTED BEHAVIOR**      |
+| B4-005 | Fee-on-transfer tokens                                                 | **OUT OF SCOPE**           |
+| B4-006 | Connector delegatecall storage collision                               | **EXPECTED ADMIN POWER**   |
+| B4-007 | swapTarget persistent approval                                         | **EXPECTED ADMIN POWER**   |
+| B4-008 | Connector naming collision                                             | **FALSE POSITIVE**         |
 
 ---
 
 ## B4-001: Shares minted before connector deposit
 
-The Vault mints shares BEFORE calling the connector's `deposit()`. Between `_mint()` and the delegatecall, no external calls are made to untrusted contracts. The asset transfer uses `safeTransferFrom` which can trigger ERC777 hooks, but these hooks execute during `_mint` (not between mint and deposit, since `_mint` is called after `safeTransferFrom`).
+| Classification | **EXPECTED BEHAVIOR** |
+| -------------- | --------------------- |
 
-**Classification**: EXPECTED BEHAVIOR.
+The Vault calls `safeTransferFrom` (user→vault), then `_mint`, then `connector.delegatecall`. The ERC777 hook occurs during `safeTransferFrom`, BEFORE `_mint`. The `nonReentrant` modifier blocks reentrant state-changing calls. The vault's `_deposit` is called within the user's initial `deposit()` call, which is protected by `nonReentrant`.
 
-## B4-002: Balance-delta withdrawal protects against partial returns
+---
 
-The Vault transfers `asset.balanceOf(vault) - balanceBefore` rather than the requested amount. This safely handles:
+## B4-002: Short withdrawal — shares burned, connector returns less
 
-- Partial liquidity (connector returns less)
-- Zero returns (connector reverts or returns 0)
-- Rate changes (sDAI/sUSDS rate changes between preview and execution)
+| Classification | **NEEDS PRODUCTION CHECK** |
+| -------------- | -------------------------- |
 
-**Classification**: EXPECTED BEHAVIOR.
+### Root Cause
 
-## B4-003: Connector update preserves existing positions
+The Vault's `_withdraw` function (Vault.sol L656) burns shares for the FULL requested amount, then transfers only the actual balance increase from the connector:
 
-Positions are tied to the VAULT address (via delegatecall), not the connector address. Updating the connector registry does not strand assets. Tested in `test_registryUpdatePreservesPosition`.
+```solidity
+_burn(owner, shares);
+uint256 balanceBefore = IERC20(asset()).balanceOf(address(this));
+_connector.functionDelegateCall(abi.encodeCall(IConnector.withdraw, (IERC20(asset()), assets)));
+SafeERC20.safeTransfer(IERC20(asset()), receiver, IERC20(asset()).balanceOf(address(this)) - balanceBefore);
+```
 
-**Classification**: EXPECTED BEHAVIOR.
+If the connector returns less than requested (without reverting), the withdrawing user receives fewer assets while their full shares are already burned. The shortfall is a windfall for remaining shareholders.
 
-## B4-004: Deposit fee idle balance is not invested
+### Numerical Proof
 
-The deposit fee stays as idle balance in the vault. This is by design — the fee is owed to fee recipients. It's tracked in FeeDispatcher and dispatched separately.
+**Scenario: Connector returns 50%**
 
-**Classification**: EXPECTED BEHAVIOR.
+| Metric                                                 | Value                    |
+| ------------------------------------------------------ | ------------------------ |
+| Alice deposit                                          | 100,000 USDC             |
+| Bob deposit                                            | 100,000 USDC             |
+| Total assets                                           | 200,000 USDC             |
+| Alice previewRedeem (fair value)                       | 100,000 USDC             |
+| Alice redeemed (returned by vault.redeem)              | 100,000 USDC (requested) |
+| Alice actually received (after connector returned 50%) | **50,000 USDC**          |
+| Alice shortfall                                        | **50,000 USDC**          |
+| Alice shares after                                     | **0 (burned)**           |
+| Bob withdrawable value after                           | 149,999.999999 USDC      |
+| Bob windfall from Alice shortfall                      | **49,999.999999 USDC**   |
 
-## B4-005: Fee-on-transfer tokens not fully supported
+**Scenario: Connector returns 0%**
 
-Fee-on-transfer tokens result in fewer assets being invested than shares were minted against. The protocol does not claim broad ERC20 support for fee-on-transfer tokens.
+| Metric         | Value          |
+| -------------- | -------------- |
+| Alice received | **0 USDC**     |
+| Alice shares   | **0 (burned)** |
+| Bob now owns   | ~200,000 USDC  |
 
-**Classification**: OUT OF SCOPE.
+### Production Applicability
 
-## B4-006: Delegated connector can corrupt vault storage
+**This is only exploitable if a production connector can succeed while returning less than the requested withdrawal amount.** Each connector:
 
-Connectors execute via `functionDelegateCall`. A malicious connector (or one with storage state variables) could corrupt vault storage by writing to vault storage at the connector's storage slot positions. All production connectors use only immutable variables, mitigating this.
+- **Aave V3**: `withdraw()` returns actual amount withdrawn. If liquidity is insufficient, Aave reverts. If `amount = type(uint256).max`, Aave withdraws max available (returns actual). **No short return without revert.**
+- **Compound V3**: `withdraw()` reverts on insufficient liquidity. **No short return.**
+- **MetaMorpho**: ERC4626 `withdraw()` reverts if assets cannot be provided. `maxWithdraw` reflects available liquidity. **No short return.**
+- **sDAI/sUSDS**: ERC4626 `withdraw()` guarantees exact DAI/USDS output. **No short return.**
+- **Angle**: Same as sDAI/sUSDS. **No short return.**
 
-**Classification**: EXPECTED ADMIN POWER (requires CONNECTOR_MANAGER role to register malicious connector).
+### Conclusion
 
-## B4-007: Reinvest swapTarget retains max approval
+The vulnerability is **theoretically valid** (shares burned > assets delivered) but **cannot be triggered by any in-scope production connector**. All connectors either revert on failure or return exactly the requested amount. A malicious connector (requiring CONNECTOR_MANAGER role) could exploit this.
 
-The `reinvest()` functions in AaveV3 and CompoundV3 connectors leave `forceApprove(swapTarget, type(uint256).max)` for the reward token. If swapTarget is compromised, reward tokens can be drained.
+**NEEDS PRODUCTION CHECK**: Verify that no production connector can succeed while returning less than requested. If confirmed impossible for all 6 connectors, reclassify as EXPECTED BEHAVIOR.
 
-**Classification**: EXPECTED ADMIN POWER (swapTarget is immutable).
+---
 
-## B4-008: Connector naming collision in registry
+## B4-003: Connector replacement with incompatible market
 
-The `ConnectorRegistry` uses a `bytes32` name for each connector. If two connectors are added with the same name (different hash), the second would revert with `ConnectorAlreadyExists`. If a connector is removed and re-added, there's no issue.
+| Classification | **EXPECTED ADMIN POWER** |
+| -------------- | ------------------------ |
 
-**Classification**: EXPECTED ADMIN POWER.
+Replacing a connector with one pointing to a different protocol could:
+
+- Leave receipt tokens (aTokens, MetaMorpho shares) in the vault, unreadable by the new connector
+- Report zero `totalAssets()` (new connector reads different protocol)
+- Prevent withdrawal of old positions
+
+However, this requires CONNECTOR_MANAGER role (admin power). Old receipt tokens remain in the vault and could be recovered by restoring the old connector.
+
+---
+
+## B4-004: Deposit fee idle balance
+
+| Classification | **EXPECTED BEHAVIOR** |
+
+---
+
+## B4-005: Fee-on-transfer tokens
+
+| Classification | **OUT OF SCOPE** |
+
+---
+
+## B4-006: Connector delegatecall storage collision
+
+| Classification | **EXPECTED ADMIN POWER** |
+
+Connectors that use storage state variables would corrupt vault storage during delegatecall. All production connectors use only immutables.
+
+---
+
+## B4-007: swapTarget persistent approval
+
+| Classification | **EXPECTED ADMIN POWER** |
+
+The `reinvest()` functions leave `forceApprove(swapTarget, type(uint256).max)` for the reward token. If swapTarget is compromised, reward tokens can be drained. swapTarget is immutable and controlled during deployment.
+
+---
+
+## B4-008: Connector naming collision
+
+| Classification | **FALSE POSITIVE** |
+
+Normal registry validation — duplicate names revert as expected.
