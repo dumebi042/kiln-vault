@@ -5,7 +5,7 @@
 | ID     | Title                                                                  | Classification             |
 | ------ | ---------------------------------------------------------------------- | -------------------------- |
 | B4-001 | Shares minted before connector deposit                                 | **EXPECTED BEHAVIOR**      |
-| B4-002 | Short withdrawal: shares burned for full value, connector returns less | **NEEDS PRODUCTION CHECK** |
+| B4-002 | Short withdrawal: shares burned for full value, connector returns less | **EXPECTED ADMIN POWER** |
 | B4-003 | Connector replacement with incompatible market                         | **EXPECTED ADMIN POWER**   |
 | B4-004 | Deposit fee idle balance                                               | **EXPECTED BEHAVIOR**      |
 | B4-005 | Fee-on-transfer tokens                                                 | **OUT OF SCOPE**           |
@@ -26,7 +26,7 @@ The Vault calls `safeTransferFrom` (user→vault), then `_mint`, then `connector
 
 ## B4-002: Short withdrawal — shares burned, connector returns less
 
-| Classification | **NEEDS PRODUCTION CHECK** |
+| Classification | **EXPECTED ADMIN POWER** |
 | -------------- | -------------------------- |
 
 ### Root Cause
@@ -75,13 +75,16 @@ If the connector returns less than requested (without reverting), the withdrawin
 - **Compound V3**: `withdraw()` reverts on insufficient liquidity. **No short return.**
 - **MetaMorpho**: ERC4626 `withdraw()` reverts if assets cannot be provided. `maxWithdraw` reflects available liquidity. **No short return.**
 - **sDAI/sUSDS**: ERC4626 `withdraw()` guarantees exact DAI/USDS output. **No short return.**
-- **Angle**: Same as sDAI/sUSDS. **No short return.**
-
 ### Conclusion
 
-The vulnerability is **theoretically valid** (shares burned > assets delivered) but **cannot be triggered by any in-scope production connector**. All connectors either revert on failure or return exactly the requested amount. A malicious connector (requiring CONNECTOR_MANAGER role) could exploit this.
+The short-return weakness is technically real: shares can be burned for full value while fewer
+assets are delivered. However, all six production connectors (Aave V3, Compound V3, MetaMorpho,
+sDAI, sUSDS, Angle) either return the exact requested amount or revert entirely. No unprivileged
+production path triggers this condition. Triggering it requires CONNECTOR_MANAGER_ROLE to
+register a malicious or incompatible connector.
 
-**NEEDS PRODUCTION CHECK**: Verify that no production connector can succeed while returning less than requested. If confirmed impossible for all 6 connectors, reclassify as EXPECTED BEHAVIOR.
+**Classification**: EXPECTED ADMIN POWER. Vault-level unsafe trust assumption confirmed,
+but not exploitable without admin privilege in current production scope.
 
 ---
 
